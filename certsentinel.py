@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa, ec
 import json
 from dotenv import load_dotenv
 import os
+import ctl_structs
 
 # Default configuration values
 CT_LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
@@ -172,62 +173,26 @@ def parse_ct_entry(entry: dict, log_url: str, index: int) -> Optional[dict]:
     if len(leaf_bytes) < 12:
         return None
     
-    entry_type = int.from_bytes(leaf_bytes[10:12], byteorder='big')
-    leaf_cert_bytes = None
-    chain_cert_bytes = []
-    
+    leaf_cert = ctl_structs.MerkleTreeHeader.parse(leaf_bytes)
+
     try:
-        if entry_type == 0:  # X509LogEntry
-            if len(leaf_bytes) < 15:
-                return None
-            cert_len = int.from_bytes(leaf_bytes[12:15], byteorder='big')
-            leaf_cert_bytes = leaf_bytes[15:15+cert_len]
-            offset = 0
-            while offset < len(extra_bytes):
-                if offset + 3 > len(extra_bytes):
-                    break
-                cert_len = int.from_bytes(extra_bytes[offset:offset+3], byteorder='big')
-                offset += 3
-                if offset + cert_len > len(extra_bytes):
-                    break
-                cert_bytes = extra_bytes[offset:offset+cert_len]
-                offset += cert_len
-                if cert_bytes:
-                    chain_cert_bytes.append(cert_bytes)
-        elif entry_type == 1:  # PrecertLogEntry
-            offset = 0
-            if len(extra_bytes) < 3:
-                return None
-            precert_len = int.from_bytes(extra_bytes[offset:offset+3], byteorder='big')
-            offset += 3
-            if offset + precert_len > len(extra_bytes):
-                return None
-            leaf_cert_bytes = extra_bytes[offset:offset+precert_len]
-            offset += precert_len
-            while offset < len(extra_bytes):
-                if offset + 3 > len(extra_bytes):
-                    break
-                cert_len = int.from_bytes(extra_bytes[offset:offset+3], byteorder='big')
-                offset += 3
-                if offset + cert_len > len(extra_bytes):
-                    break
-                cert_bytes = extra_bytes[offset:offset+cert_len]
-                offset += cert_len
-                if cert_bytes:
-                    chain_cert_bytes.append(cert_bytes)
+        if leaf_cert.LogEntryType == "X509LogEntryType":
+            cert_data = ctl_structs.Certificate.parse(leaf_cert.Entry).CertData
+            cert = x509.load_der_x509_certificate(cert_data, default_backend())
+            extra_data = ctl_structs.CertificateChain.parse(extra_bytes).Chain
+            chain = [x509.load_der_x509_certificate(cert.CertData, default_backend()) for cert in extra_data]
+        elif leaf_cert.LogEntryType == "PrecertLogEntryType":
+            extra_data = ctl_structs.PreCertEntry.parse(extra_bytes)
+            cert_data = extra_data.LeafCert.CertData
+            cert = x509.load_der_x509_certificate(cert_data, default_backend())
+            chain = [x509.load_der_x509_certificate(cert.CertData, default_backend()) for cert in extra_data.ChainData.Chain]   
         else:
             return None
-    except Exception as e:
-        logging.error(f"Error parsing entry structure: {e}")
-        return None
-    
-    try:
-        cert = x509.load_der_x509_certificate(leaf_cert_bytes, default_backend())
     except Exception as e:
         logging.error(f"Certificate parse error: {e}")
         return None
 
-    fingerprint = hashlib.sha256(leaf_cert_bytes).hexdigest().upper()
+    fingerprint = hashlib.sha256(cert_data).hexdigest().upper()
     with seen_lock:
         if fingerprint in seen_certs:
             return None
@@ -238,16 +203,13 @@ def parse_ct_entry(entry: dict, log_url: str, index: int) -> Optional[dict]:
     current_time = datetime.now(timezone.utc).isoformat(timespec='milliseconds') + "Z"
     
     chain_summary = []
-    for cbytes in chain_cert_bytes:
-        try:
-            chain_cert = x509.load_der_x509_certificate(cbytes, default_backend())
-            cn = chain_cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-            chain_summary.append({
-                "cn": cn[0].value if cn else chain_cert.subject.rfc4514_string(),
-                "not_after": chain_cert.not_valid_after_utc.isoformat(timespec='milliseconds') + "Z"
-            })
-        except Exception:
-            continue
+    for cert in chain:
+        cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        not_after = cert.not_valid_after_utc.isoformat(timespec='milliseconds') + "Z"
+        chain_summary.append({
+            "cn": cn[0].value if cn else cert.subject.rfc4514_string(),
+            "not_after": not_after
+        })
 
     try:
         aia = cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
@@ -288,7 +250,7 @@ def parse_ct_entry(entry: dict, log_url: str, index: int) -> Optional[dict]:
         "log_url": log_url,
         "timestamp": int(time.time() * 1000),
         "type": "x509",
-        "update_type": "X509LogEntry" if entry_type == 0 else "PrecertLogEntry",
+        "update_type": "X509LogEntry" if leaf_cert.LogEntryType == "X509LogEntryType" else "PrecertLogEntry",
         "fingerprint": fingerprint,
         "version": cert.version.value + 1,
         "serial_number": str(cert.serial_number),
