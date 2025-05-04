@@ -90,24 +90,6 @@ def make_request(url: str, session: requests.Session, timeout: int, max_retries:
                 logging.error(f"Failed after {max_retries} attempts: {e}")
                 return None
 
-def parse_ct_entry(entry: dict, log_url: str, log_name, index: int) -> Optional[dict]:
-    try:
-        ctl_entry_obj = CTLEntry(entry, log_url, log_name, index) 
-        if not ctl_entry_obj.is_valid:
-            return None 
-
-        with seen_lock:
-            if ctl_entry_obj.fingerprint in seen_certs:
-                return None
-            seen_certs[ctl_entry_obj.fingerprint] = True
-
-        cert_meta = ctl_entry_obj.to_dict()
-        return cert_meta
-
-    except Exception as e:
-        logging.error(f"Failed to create CTLEntry object: {e}", exc_info=True)
-        return None
-
 def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: Optional[tuple]):
     desc = log_info.get("description", "CT Log")
     url = log_info.get("url", "")
@@ -166,11 +148,20 @@ def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: O
                     entries = data.get("entries", [])
                     docs = []
                     for idx, entry in enumerate(entries, start=start):
-                        cert_meta = parse_ct_entry(entry, url, desc, idx)
-                        if cert_meta:
-                            print(cert_meta["subject_cn"])
-                            cert_meta["source"]["name"] = desc
-                            docs.append(cert_meta)
+                        try:
+                            ctl_entry = CTLEntry(entry, url, desc, idx)
+                        except Exception as e:
+                            logging.error(f"Failed to create entry {idx} for {desc}: {e}")
+                            continue
+
+                        with seen_lock:
+                            if ctl_entry.fingerprint in seen_certs:
+                                continue
+                            seen_certs[ctl_entry.fingerprint] = True
+
+                        if ctl_entry.is_valid:
+                            print(ctl_entry.subject_cn)
+                            docs.append(ctl_entry.to_dict())
 
                     if docs:
                         bulk_lines = ""
