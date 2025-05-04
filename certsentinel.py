@@ -11,6 +11,8 @@ import json
 from dotenv import load_dotenv
 import os
 from ctl_entry import CTLEntry
+from request_handler import RequestHandler
+from ct_log_list_provider import CTLogListProvider
 
 # Default configuration values
 CT_LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
@@ -34,61 +36,10 @@ logging.basicConfig(
 
 seen_certs = None  # Initialized in main
 seen_lock = threading.Lock()
-session = requests.Session()
 stop_event = threading.Event()
+session = requests.Session()
+request_handler = RequestHandler(session, REQUEST_TIMEOUT)
 
-def load_log_list(url: str):
-    try:
-        resp = make_request(url, session, REQUEST_TIMEOUT)
-        if not resp:
-            raise Exception("Failed to fetch log list")
-        data = resp.json()
-    except Exception as e:
-        logging.error(f"Could not load CT log list: {e}")
-        return []
-    logs = []
-    log_entries = data.get("logs", data.get("operators", []))
-    if "operators" in data:
-        log_entries = []
-        for operator in data["operators"]:
-            log_entries.extend(operator.get("logs", []))
-    now = datetime.now(timezone.utc)
-    for log in log_entries:
-        state = log.get("state", {})
-        if "usable" not in state:
-            continue
-        interval = log.get("temporal_interval")
-        if interval:
-            try:
-                start = datetime.fromisoformat(interval["start_inclusive"].replace("Z", "+00:00"))
-                end = datetime.fromisoformat(interval["end_exclusive"].replace("Z", "+00:00"))
-                if now < start or now >= end:
-                    continue
-            except Exception as e:
-                logging.warning(f"Cannot parse temporal_interval for {log.get('description')}: {e}")
-        logs.append(log)
-    logging.info(f"Loaded {len(logs)} CT logs to monitor.")
-    return logs
-
-def make_request(url: str, session: requests.Session, timeout: int, max_retries: int = 3) -> Optional[requests.Response]:
-    for attempt in range(max_retries):
-        try:
-            resp = session.get(url, timeout=timeout)
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                wait_time = int(retry_after) if retry_after and retry_after.isdigit() else min(2 ** attempt, 60)
-                logging.warning(f"429 Too Many Requests for {url}. Waiting {wait_time} seconds...")
-                time.sleep(wait_time)
-                continue
-            resp.raise_for_status()
-            return resp
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"Request to {url} failed: {e}. Attempt {attempt + 1}/{max_retries}")
-            if attempt < max_retries - 1:
-                time.sleep(min(2 ** attempt, 60))
-            else:
-                logging.error(f"Failed after {max_retries} attempts: {e}")
-                return None
 
 def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: Optional[tuple]):
     desc = log_info.get("description", "CT Log")
@@ -99,8 +50,7 @@ def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: O
     sth_url = url + "ct/v1/get-sth"
     entries_url = url + "ct/v1/get-entries"
     next_index = 0
-    
-    resp = make_request(sth_url, session, REQUEST_TIMEOUT)
+    resp = request_handler.get(sth_url, REQUEST_TIMEOUT)
     if resp:
         try:
             sth_data = resp.json()
@@ -116,7 +66,7 @@ def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: O
 
     while not stop_event.is_set():
         try:
-            resp = make_request(sth_url, session, REQUEST_TIMEOUT)
+            resp = request_handler.get(sth_url, REQUEST_TIMEOUT)
             if not resp:
                 current_size = next_index
             else:
@@ -133,7 +83,7 @@ def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: O
                 
                 while start <= end and not stop_event.is_set():
                     batch_url = f"{entries_url}?start={start}&end={end}"
-                    resp_entries = make_request(batch_url, session, REQUEST_TIMEOUT)
+                    resp_entries = request_handler.get(batch_url, REQUEST_TIMEOUT)
                     if not resp_entries:
                         start = end + 1
                         continue
@@ -211,7 +161,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
-    logs = load_log_list(CT_LOG_LIST_URL)
+    logs = CTLogListProvider(CT_LOG_LIST_URL, request_handler).get_logs()
+
     if not logs:
         logging.error("No CT logs to monitor. Exiting.")
         exit(1)
