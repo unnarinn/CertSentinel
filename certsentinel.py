@@ -2,21 +2,15 @@
 import threading
 import logging
 import signal
-import base64
-import hashlib
 from datetime import datetime, timezone
 import time
 from typing import Optional
 import requests
 from cachetools import TTLCache
-from cryptography import x509
-from cryptography.hazmat.backends import default_backend
-from cryptography.x509.oid import NameOID, ExtensionOID
-from cryptography.hazmat.primitives.asymmetric import rsa, ec
 import json
 from dotenv import load_dotenv
 import os
-import ctl_structs
+from ctl_entry import CTLEntry
 
 # Default configuration values
 CT_LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/log_list.json"
@@ -42,31 +36,6 @@ seen_certs = None  # Initialized in main
 seen_lock = threading.Lock()
 session = requests.Session()
 stop_event = threading.Event()
-
-def calculate_valid_days(not_before: datetime, not_after: datetime) -> int:
-    return (not_after - not_before).days
-
-def get_key_usage(cert: x509.Certificate) -> list:
-    try:
-        ku = cert.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value
-        usage = []
-        if ku.digital_signature: usage.append("digital_signature")
-        if ku.content_commitment: usage.append("content_commitment")
-        if ku.key_encipherment: usage.append("key_encipherment")
-        if ku.data_encipherment: usage.append("data_encipherment")
-        if ku.key_agreement: usage.append("key_agreement")
-        if ku.key_cert_sign: usage.append("key_cert_sign")
-        if ku.crl_sign: usage.append("crl_sign")
-        return usage
-    except x509.ExtensionNotFound:
-        return []
-
-def get_extended_key_usage(cert: x509.Certificate) -> list:
-    try:
-        eku = cert.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE).value
-        return [usage._name.lower() for usage in eku]
-    except x509.ExtensionNotFound:
-        return []
 
 def load_log_list(url: str):
     try:
@@ -101,42 +70,6 @@ def load_log_list(url: str):
     logging.info(f"Loaded {len(logs)} CT logs to monitor.")
     return logs
 
-def get_domains_from_cert(cert: x509.Certificate) -> list:
-    domains = []
-    try:
-        for attr in cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME):
-            if attr.value not in domains:
-                domains.append(attr.value)
-    except Exception:
-        pass
-    try:
-        san = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
-        for name in san.get_values_for_type(x509.DNSName):
-            if name not in domains:
-                domains.append(name)
-    except x509.ExtensionNotFound:
-        pass
-    return domains
-
-def get_issuer_name(cert: x509.Certificate) -> str:
-    name = None
-    try:
-        issuer_cn = cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)
-        if issuer_cn:
-            name = issuer_cn[0].value
-    except Exception:
-        pass
-    if not name:
-        try:
-            issuer_o = cert.issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
-            if issuer_o:
-                name = issuer_o[0].value
-        except Exception:
-            pass
-    if not name:
-        name = cert.issuer.rfc4514_string()
-    return name
-
 def make_request(url: str, session: requests.Session, timeout: int, max_retries: int = 3) -> Optional[requests.Response]:
     for attempt in range(max_retries):
         try:
@@ -157,133 +90,23 @@ def make_request(url: str, session: requests.Session, timeout: int, max_retries:
                 logging.error(f"Failed after {max_retries} attempts: {e}")
                 return None
 
-def parse_ct_entry(entry: dict, log_url: str, index: int) -> Optional[dict]:
-    leaf_b64 = entry.get("leaf_input")
-    extra_b64 = entry.get("extra_data")
-    if not leaf_b64 or not extra_b64:
-        return None
-    
+def parse_ct_entry(entry: dict, log_url: str, log_name, index: int) -> Optional[dict]:
     try:
-        leaf_bytes = base64.b64decode(leaf_b64)
-        extra_bytes = base64.b64decode(extra_b64)
+        ctl_entry_obj = CTLEntry(entry, log_url, log_name, index) 
+        if not ctl_entry_obj.is_valid:
+            return None 
+
+        with seen_lock:
+            if ctl_entry_obj.fingerprint in seen_certs:
+                return None
+            seen_certs[ctl_entry_obj.fingerprint] = True
+
+        cert_meta = ctl_entry_obj.to_dict()
+        return cert_meta
+
     except Exception as e:
-        logging.warning(f"Base64 decoding error: {e}")
+        logging.error(f"Failed to create CTLEntry object: {e}", exc_info=True)
         return None
-    
-    if len(leaf_bytes) < 12:
-        return None
-    
-    leaf_cert = ctl_structs.MerkleTreeHeader.parse(leaf_bytes)
-
-    try:
-        if leaf_cert.LogEntryType == "X509LogEntryType":
-            cert_data = ctl_structs.Certificate.parse(leaf_cert.Entry).CertData
-            cert = x509.load_der_x509_certificate(cert_data, default_backend())
-            extra_data = ctl_structs.CertificateChain.parse(extra_bytes).Chain
-            chain = [x509.load_der_x509_certificate(cert.CertData, default_backend()) for cert in extra_data]
-        elif leaf_cert.LogEntryType == "PrecertLogEntryType":
-            extra_data = ctl_structs.PreCertEntry.parse(extra_bytes)
-            cert_data = extra_data.LeafCert.CertData
-            cert = x509.load_der_x509_certificate(cert_data, default_backend())
-            chain = [x509.load_der_x509_certificate(cert.CertData, default_backend()) for cert in extra_data.ChainData.Chain]   
-        else:
-            return None
-    except Exception as e:
-        logging.error(f"Certificate parse error: {e}")
-        return None
-
-    fingerprint = hashlib.sha256(cert_data).hexdigest().upper()
-    with seen_lock:
-        if fingerprint in seen_certs:
-            return None
-        seen_certs[fingerprint] = True
-
-    not_before = cert.not_valid_before_utc.isoformat(timespec='milliseconds') + "Z"
-    not_after = cert.not_valid_after_utc.isoformat(timespec='milliseconds') + "Z"
-    current_time = datetime.now(timezone.utc).isoformat(timespec='milliseconds') + "Z"
-    
-    chain_summary = []
-    for cert in chain:
-        cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-        not_after = cert.not_valid_after_utc.isoformat(timespec='milliseconds') + "Z"
-        chain_summary.append({
-            "cn": cn[0].value if cn else cert.subject.rfc4514_string(),
-            "not_after": not_after
-        })
-
-    try:
-        aia = cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
-        ocsp_urls = [ad.access_location.value for ad in aia if ad.access_method == x509.oid.AuthorityInformationAccessOID.OCSP]
-        issuer_urls = [ad.access_location.value for ad in aia if ad.access_method == x509.oid.AuthorityInformationAccessOID.CA_ISSUERS]
-        ocsp_url = ocsp_urls[0] if ocsp_urls else None
-        issuer_cert_url = issuer_urls[0] if issuer_urls else None
-    except x509.ExtensionNotFound:
-        ocsp_url = None
-        issuer_cert_url = None
-
-    try:
-        crl_dps = cert.extensions.get_extension_for_oid(ExtensionOID.CRL_DISTRIBUTION_POINTS).value
-        crl_urls = [dp.full_name[0].value for dp in crl_dps if dp.full_name]
-        crl_url = crl_urls[0] if crl_urls else None
-    except x509.ExtensionNotFound:
-        crl_url = None
-
-    # Handle different public key types
-    public_key = cert.public_key()
-    if isinstance(public_key, rsa.RSAPublicKey):
-        algorithm = "rsa"
-        key_size = public_key.key_size
-        public_exponent = public_key.public_numbers().e
-        curve_name = None
-    elif isinstance(public_key, ec.EllipticCurvePublicKey):
-        algorithm = "ec"
-        key_size = public_key.key_size
-        public_exponent = None
-        curve_name = public_key.curve.name
-    else:
-        algorithm = "unknown"
-        key_size = None
-        public_exponent = None
-        curve_name = None
-
-    return {
-        "log_url": log_url,
-        "timestamp": int(time.time() * 1000),
-        "type": "x509",
-        "update_type": "X509LogEntry" if leaf_cert.LogEntryType == "X509LogEntryType" else "PrecertLogEntry",
-        "fingerprint": fingerprint,
-        "version": cert.version.value + 1,
-        "serial_number": str(cert.serial_number),
-        "signature_algorithm": f"{cert.signature_hash_algorithm.name}_{algorithm}",
-        "issuer_cn": get_issuer_name(cert),
-        "subject_cn": cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value if cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME) else None,
-        "validity": {
-            "not_before": not_before,
-            "not_after": not_after,
-            "valid_days": calculate_valid_days(cert.not_valid_before_utc, cert.not_valid_after_utc)
-        },
-        "subject_public_key_info": {
-            "algorithm": algorithm,
-            "key_size_bits": key_size,
-            "public_exponent": public_exponent,
-            "curve_name": curve_name
-        },
-        "all_domains": get_domains_from_cert(cert),
-        "ocsp_url": ocsp_url,
-        "issuer_cert_url": issuer_cert_url,
-        "crl_url": crl_url,
-        "key_usage": get_key_usage(cert),
-        "extended_key_usage": get_extended_key_usage(cert),
-        "cert_index": index,
-        "cert_link": f"{log_url}ct/v1/get-entries?start={index}&end={index}",
-        "@timestamp": current_time,
-        "seen": current_time,
-        "source": {
-            "url": log_url,
-            "name": ""
-        },
-        "chain_summary": chain_summary
-    }
 
 def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: Optional[tuple]):
     desc = log_info.get("description", "CT Log")
@@ -292,7 +115,7 @@ def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: O
         url += "/"
     
     sth_url = url + "ct/v1/get-sth"
-    entriELASTICSEARCH_HOSTS = url + "ct/v1/get-entries"
+    entries_url = url + "ct/v1/get-entries"
     next_index = 0
     
     resp = make_request(sth_url, session, REQUEST_TIMEOUT)
@@ -327,7 +150,7 @@ def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: O
                 end = min(current_size - 1, start + BATCH_SIZE - 1)
                 
                 while start <= end and not stop_event.is_set():
-                    batch_url = f"{entriELASTICSEARCH_HOSTS}?start={start}&end={end}"
+                    batch_url = f"{entries_url}?start={start}&end={end}"
                     resp_entries = make_request(batch_url, session, REQUEST_TIMEOUT)
                     if not resp_entries:
                         start = end + 1
@@ -343,8 +166,9 @@ def monitor_log(log_info: dict, ELASTICSEARCH_HOSTS: str, es_index: str, auth: O
                     entries = data.get("entries", [])
                     docs = []
                     for idx, entry in enumerate(entries, start=start):
-                        cert_meta = parse_ct_entry(entry, url, idx)
+                        cert_meta = parse_ct_entry(entry, url, desc, idx)
                         if cert_meta:
+                            print(cert_meta["subject_cn"])
                             cert_meta["source"]["name"] = desc
                             docs.append(cert_meta)
 
