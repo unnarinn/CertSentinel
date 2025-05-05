@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional
 from cachetools import TTLCache
 from dotenv import load_dotenv
 
-from ctl_entry import CTLEntry
-from request_handler import RequestHandler
+from .ctl_entry import CTLEntry
+from .request_handler import RequestHandler
 
 load_dotenv()
 ELASTICSEARCH_HOSTS = os.getenv("ELASTICSEARCH_HOSTS", "http://localhost:9200")
@@ -26,6 +26,7 @@ class LogMonitor:
         stop_event: threading.Event,
         seen_certs: TTLCache,
         seen_lock: threading.Lock,
+        file_lock: threading.Lock,
         batch_size: int = 256,
         fetch_interval: int = 60,
     ):
@@ -34,6 +35,7 @@ class LogMonitor:
         self.stop_event = stop_event
         self.seen_certs = seen_certs
         self.seen_lock = seen_lock
+        self.file_lock = file_lock
         self.batch_size = batch_size
         self.fetch_interval = fetch_interval
         self.desc = log_info.get("description", "CT Log")
@@ -85,9 +87,9 @@ class LogMonitor:
                 logging.warning(f"Entries data from {batch_url} did not contain a list under 'entries'.")
         return None
 
-    def _process_and_filter_entries(self, entries: List[Dict[str, Any]], start_index: int) -> List[Dict[str, Any]]:
+    def _process_and_filter_entries(self, entries: List[Dict[str, Any]], start_index: int) -> List[CTLEntry]:
         """Processes raw entries, creates CTLEntry objects, filters seen, returns docs."""
-        docs_to_index = []
+        new_entries = []
         for i, entry_data in enumerate(entries):
             current_entry_index = start_index + i
             try:
@@ -101,18 +103,14 @@ class LogMonitor:
                             should_process = True
 
                 if should_process and ctl_entry.is_valid:
-                    print(ctl_entry.subject_cn)
-                    doc = ctl_entry.to_dict()
-                    # Uncomment this to index the document
-                    # if doc:
-                    #     docs_to_index.append(doc)
+                    new_entries.append(ctl_entry)
             except Exception as e:
                 logging.error(f"Failed to process entry {current_entry_index} for {self.desc}: {e}", exc_info=True)
                 continue
 
-        return docs_to_index
+        return new_entries
 
-    def _index_batch_to_es(self, docs: List[Dict[str, Any]]) -> bool:
+    def _index_batch_to_es(self, docs: List[CTLEntry]) -> bool:
         """Indexes a batch of documents to Elasticsearch"""
         if not docs:
             return True
@@ -121,7 +119,7 @@ class LogMonitor:
         for doc in docs:
             meta = {"index": {"_index": ES_INDEX}}
             bulk_lines += json.dumps(meta) + "\n"
-            bulk_lines += json.dumps(doc) + "\n"
+            bulk_lines += json.dumps(doc.to_dict()) + "\n"
 
         result = self.request_handler.post_bulk_ndjson(
             url=self.es_bulk_url,
@@ -170,15 +168,30 @@ class LogMonitor:
                 start = end + 1
                 continue
 
-            docs_to_index = self._process_and_filter_entries(raw_entries, start)
+            new_entries = self._process_and_filter_entries(raw_entries, start)
 
-            if docs_to_index:
-                logging.info(f"{self.desc}: Indexing {len(docs_to_index)} new certificates from batch [{start}, {end}]")
-                if not self._index_batch_to_es(docs_to_index):
-                    logging.error(
-                        f"Failed to index batch [{start}, {end}] for {self.desc} to Elasticsearch. Stopping batch processing for this cycle."
-                    )
-                    break
+            if not new_entries:
+                continue
+
+            # save new domains to file
+            # TODO: make this configurable
+            with self.file_lock:
+                try:
+                    with open("new_domains.txt", "a") as f:
+                        for entry in new_entries:
+                            if entry.subject_cn:
+                                f.write(f"{entry.subject_cn}\n")
+                except IOError as e:
+                    logging.error(f"Error writing to new_domains.txt: {e}")
+
+            # TODO: also make this configurable
+            # Uncomment this to enable Elasticsearch indexing
+            # logging.info(f"{self.desc}: Indexing {len(new_entries)} new certificates from batch [{start}, {end}]")
+            # if not self._index_batch_to_es(new_entries):
+            #     logging.error(
+            #         f"Failed to index batch [{start}, {end}] for {self.desc} to Elasticsearch. Stopping batch processing for this cycle."
+            #     )
+            #     break
 
             start = end + 1
         self.next_index = start
