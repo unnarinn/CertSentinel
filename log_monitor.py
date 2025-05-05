@@ -43,7 +43,7 @@ class LogMonitor:
         self.sth_url = self.url + "ct/v1/get-sth"
         self.entries_url = self.url + "ct/v1/get-entries"
         self.next_index = 0
-        self.es_bulk_url = f"{self.es_hosts}/_bulk"
+        self.es_bulk_url = f"{ELASTICSEARCH_HOSTS}/_bulk"
 
     def _initialize_index(self) -> bool:
         """Fetches initial STH and sets the starting index. Returns True on success."""
@@ -103,8 +103,9 @@ class LogMonitor:
                 if should_process and ctl_entry.is_valid:
                     print(ctl_entry.subject_cn)
                     doc = ctl_entry.to_dict()
-                    if doc:
-                        docs_to_index.append(doc)
+                    # Uncomment this to index the document
+                    # if doc:
+                    #     docs_to_index.append(doc)
             except Exception as e:
                 logging.error(f"Failed to process entry {current_entry_index} for {self.desc}: {e}", exc_info=True)
                 continue
@@ -118,14 +119,14 @@ class LogMonitor:
 
         bulk_lines = ""
         for doc in docs:
-            meta = {"index": {"_index": self.es_index}}
+            meta = {"index": {"_index": ES_INDEX}}
             bulk_lines += json.dumps(meta) + "\n"
             bulk_lines += json.dumps(doc) + "\n"
 
         result = self.request_handler.post_bulk_ndjson(
             url=self.es_bulk_url,
             ndjson_data=bulk_lines,
-            auth=self.es_auth,
+            auth=AUTH,
             timeout=self.request_handler.default_timeout,
         )
 
