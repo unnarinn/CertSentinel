@@ -1,20 +1,24 @@
 import base64
+import hashlib
 import logging
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
 from construct import Container
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
-from cryptography.x509.oid import NameOID, ExtensionOID
-from cryptography.hazmat.primitives.asymmetric import rsa, ec
-from datetime import datetime, timezone
-import time
-import hashlib
-from typing import Optional, List, Dict, Any
-import ctl_structs 
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.x509.oid import ExtensionOID, NameOID
+
+import ctl_structs
+
 
 class CTLEntry:
     """
     A class representing an entry in a certificate transparency log.
     """
+
     def __init__(self, raw_entry: dict, log_url: str, log_name: str, index: int):
         self._raw_entry = raw_entry
         self.log_url = log_url
@@ -67,8 +71,8 @@ class CTLEntry:
             return
 
         if len(self.leaf_cert_bytes) < 12:
-             logging.warning("Leaf input too short")
-             return
+            logging.warning("Leaf input too short")
+            return
 
         try:
             self.leaf_header = ctl_structs.MerkleTreeHeader.parse(self.leaf_cert_bytes)
@@ -84,35 +88,41 @@ class CTLEntry:
                 extra_parsed = ctl_structs.PreCertEntry.parse(self.extra_data_bytes)
                 cert_data = extra_parsed.LeafCert.CertData
                 self.cert = x509.load_der_x509_certificate(cert_data, default_backend())
-                self.chain = [x509.load_der_x509_certificate(c.CertData, default_backend()) for c in extra_parsed.ChainData.Chain]
+                self.chain = [
+                    x509.load_der_x509_certificate(c.CertData, default_backend()) for c in extra_parsed.ChainData.Chain
+                ]
             else:
-                 logging.warning(f"Unknown LogEntryType: {self.leaf_header.LogEntryType}")
-                 return
+                logging.warning(f"Unknown LogEntryType: {self.leaf_header.LogEntryType}")
+                return
 
             if not self.cert or cert_data is None:
-                 logging.warning("Certificate could not be loaded")
-                 return
+                logging.warning("Certificate could not be loaded")
+                return
 
             self.fingerprint = hashlib.sha256(cert_data).hexdigest().upper()
-            self.version = self.cert.version.value + 1 # x509.Version is 0-indexed (v1=0, v2=1, v3=2)
+            self.version = self.cert.version.value + 1  # x509.Version is 0-indexed (v1=0, v2=1, v3=2)
             self.serial_number = str(self.cert.serial_number)
             pk_algorithm, pk_key_size, pk_public_exponent, pk_curve_name = self._get_public_key_info(self.cert)
             self.subject_public_key_info = {
                 "algorithm": pk_algorithm,
                 "key_size_bits": pk_key_size,
                 "public_exponent": pk_public_exponent,
-                "curve_name": pk_curve_name
+                "curve_name": pk_curve_name,
             }
-            self.signature_algorithm = f"{self.cert.signature_hash_algorithm.name}_{pk_algorithm}" if self.cert.signature_hash_algorithm else pk_algorithm
+            self.signature_algorithm = (
+                f"{self.cert.signature_hash_algorithm.name}_{pk_algorithm}"
+                if self.cert.signature_hash_algorithm
+                else pk_algorithm
+            )
             self.issuer_cn = self._get_issuer_name(self.cert)
             subject_cn_attr = self.cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
             self.subject_cn = subject_cn_attr[0].value if subject_cn_attr else None
             not_before_utc = self.cert.not_valid_before_utc
             not_after_utc = self.cert.not_valid_after_utc
             self.validity = {
-                "not_before": not_before_utc.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-                "not_after": not_after_utc.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-                "valid_days": self._calculate_valid_days(not_before_utc, not_after_utc)
+                "not_before": not_before_utc.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "not_after": not_after_utc.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "valid_days": self._calculate_valid_days(not_before_utc, not_after_utc),
             }
             self.all_domains = self._get_domains_from_cert(self.cert)
             self.ocsp_url, self.issuer_cert_url = self._get_aia_info(self.cert)
@@ -120,19 +130,19 @@ class CTLEntry:
             self.key_usage = self._get_key_usage(self.cert)
             self.extended_key_usage = self._get_extended_key_usage(self.cert)
             self.cert_link = f"{self.log_url}ct/v1/get-entries?start={self.cert_index}&end={self.cert_index}"
-            current_time_iso = datetime.now(timezone.utc).isoformat(timespec='milliseconds') + "Z"
+            current_time_iso = datetime.now(timezone.utc).isoformat(timespec="milliseconds") + "Z"
             self.at_timestamp = current_time_iso
             self.seen = current_time_iso
-            self.source = {
-                "url": self.log_url,
-                "name": self.log_name
-            }
+            self.source = {"url": self.log_url, "name": self.log_name}
             self.chain_summary = self._get_chain_summary(self.chain)
 
-            self.is_valid = True # successfully initialized
+            self.is_valid = True  # successfully initialized
 
         except Exception as e:
-            logging.error(f"Error initializing CTLEntry at index {self.cert_index} for {self.log_url}: {e}", exc_info=True)
+            logging.error(
+                f"Error initializing CTLEntry at index {self.cert_index} for {self.log_url}: {e}",
+                exc_info=True,
+            )
             self.is_valid = False
 
     def to_dict(self) -> Optional[Dict[str, Any]]:
@@ -163,7 +173,7 @@ class CTLEntry:
             "@timestamp": self.at_timestamp,
             "seen": self.seen,
             "source": self.source,
-            "chain_summary": self.chain_summary
+            "chain_summary": self.chain_summary,
         }
 
     def _get_domains_from_cert(self, cert: x509.Certificate) -> list:
@@ -184,30 +194,35 @@ class CTLEntry:
             pass
         return domains
 
-
     def _calculate_valid_days(self, not_before: datetime, not_after: datetime) -> int:
         """Calculates the number of valid days between not_before and not_after."""
         return (not_after - not_before).days
-    
+
     def _get_key_usage(self, cert: x509.Certificate) -> list:
         """Extracts key usage from the certificate."""
         try:
             ku = cert.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value
             usage = []
-            if getattr(ku, 'digital_signature', False): usage.append("digital_signature")
-            if getattr(ku, 'content_commitment', False): usage.append("content_commitment")
-            if getattr(ku, 'key_encipherment', False): usage.append("key_encipherment")
-            if getattr(ku, 'data_encipherment', False): usage.append("data_encipherment")
-            if getattr(ku, 'key_agreement', False): usage.append("key_agreement")
-            if getattr(ku, 'key_cert_sign', False): usage.append("key_cert_sign")
-            if getattr(ku, 'crl_sign', False): usage.append("crl_sign")
+            if getattr(ku, "digital_signature", False):
+                usage.append("digital_signature")
+            if getattr(ku, "content_commitment", False):
+                usage.append("content_commitment")
+            if getattr(ku, "key_encipherment", False):
+                usage.append("key_encipherment")
+            if getattr(ku, "data_encipherment", False):
+                usage.append("data_encipherment")
+            if getattr(ku, "key_agreement", False):
+                usage.append("key_agreement")
+            if getattr(ku, "key_cert_sign", False):
+                usage.append("key_cert_sign")
+            if getattr(ku, "crl_sign", False):
+                usage.append("crl_sign")
             return usage
         except x509.ExtensionNotFound:
             return []
         except Exception as e:
-             logging.warning(f"Error processing KeyUsage for {self.fingerprint}: {e}")
-             return []
-
+            logging.warning(f"Error processing KeyUsage for {self.fingerprint}: {e}")
+            return []
 
     def _get_extended_key_usage(self, cert: x509.Certificate) -> list:
         """Extracts extended key usage from the certificate."""
@@ -250,14 +265,14 @@ class CTLEntry:
             key_size = public_key.key_size
             try:
                 public_exponent = public_key.public_numbers().e
-            except Exception: 
+            except Exception:
                 public_exponent = None
         elif isinstance(public_key, ec.EllipticCurvePublicKey):
             algorithm = "ec"
             key_size = public_key.key_size
             try:
                 curve_name = public_key.curve.name
-            except Exception: 
+            except Exception:
                 curve_name = None
 
         return algorithm, key_size, public_exponent, curve_name
@@ -268,8 +283,16 @@ class CTLEntry:
         issuer_url = None
         try:
             aia = cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
-            ocsp_urls = [ad.access_location.value for ad in aia if ad.access_method == x509.oid.AuthorityInformationAccessOID.OCSP]
-            issuer_urls = [ad.access_location.value for ad in aia if ad.access_method == x509.oid.AuthorityInformationAccessOID.CA_ISSUERS]
+            ocsp_urls = [
+                ad.access_location.value
+                for ad in aia
+                if ad.access_method == x509.oid.AuthorityInformationAccessOID.OCSP
+            ]
+            issuer_urls = [
+                ad.access_location.value
+                for ad in aia
+                if ad.access_method == x509.oid.AuthorityInformationAccessOID.CA_ISSUERS
+            ]
             ocsp_url = ocsp_urls[0] if ocsp_urls else None
             issuer_url = issuer_urls[0] if issuer_urls else None
         except x509.ExtensionNotFound:
@@ -289,7 +312,6 @@ class CTLEntry:
             crl_url = None
         return crl_url
 
-
     def _get_chain_summary(self, chain: Optional[List[x509.Certificate]]) -> List[Dict[str, Any]]:
         """Creates a summary of the certificate chain."""
         summary = []
@@ -298,10 +320,10 @@ class CTLEntry:
         for chain_cert in chain:
             try:
                 cn_attr = chain_cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-                cn = cn_attr[0].value if cn_attr else self._get_issuer_name(chain_cert) 
-                not_after = chain_cert.not_valid_after_utc.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+                cn = cn_attr[0].value if cn_attr else self._get_issuer_name(chain_cert)
+                not_after = chain_cert.not_valid_after_utc.isoformat(timespec="milliseconds").replace("+00:00", "Z")
                 summary.append({"cn": cn, "not_after": not_after})
             except Exception as e:
-                 logging.warning(f"Error processing chain cert summary: {e}")
-                 summary.append({"cn": "Error Processing", "not_after": None}) 
+                logging.warning(f"Error processing chain cert summary: {e}")
+                summary.append({"cn": "Error Processing", "not_after": None})
         return summary

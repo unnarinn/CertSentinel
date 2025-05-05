@@ -1,25 +1,28 @@
-from datetime import datetime, timezone
 import logging
-from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
 from request_handler import RequestHandler
+
 
 class CTLogListProvider:
     """
     Provides a list of usable CT logs from a specified URL.
     """
+
     def __init__(self, list_url: str, request_handler: RequestHandler):
         self.list_url = list_url
-        self.request_handler = request_handler 
+        self.request_handler = request_handler
         self._usable_logs: Optional[List[Dict[str, Any]]] = None
 
     def _fetch_raw_list(self) -> Optional[Dict[str, Any]]:
-         """Fetches the raw log list JSON data from the CT log list URL."""
-         raw_data = self.request_handler.get_json(self.list_url)
-         if isinstance(raw_data, dict):
-             return raw_data
-         elif raw_data is not None:
-             logging.warning(f"Expected a dictionary from {self.list_url}, but got type {type(raw_data)}.")
-         return None
+        """Fetches the raw log list JSON data from the CT log list URL."""
+        raw_data = self.request_handler.get_json(self.list_url)
+        if isinstance(raw_data, dict):
+            return raw_data
+        elif raw_data is not None:
+            logging.warning(f"Expected a dictionary from {self.list_url}, but got type {type(raw_data)}.")
+        return None
 
     def _filter_logs(self, data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Filters the raw log data for usable and active logs."""
@@ -28,25 +31,27 @@ class CTLogListProvider:
 
         raw_log_entries = []
         if "logs" in data and isinstance(data.get("logs"), list):
-             raw_log_entries = data["logs"]
+            raw_log_entries = data["logs"]
         elif "operators" in data and isinstance(data.get("operators"), list):
-             raw_log_entries = [
-                 log for operator in data["operators"]
-                 if isinstance(operator, dict) and isinstance(operator.get("logs"), list)
-                 for log in operator["logs"]
-             ]
+            raw_log_entries = [
+                log
+                for operator in data["operators"]
+                if isinstance(operator, dict) and isinstance(operator.get("logs"), list)
+                for log in operator["logs"]
+            ]
         else:
-             logging.warning(f"Unexpected structure in CT log list data from {self.list_url}.")
-             return []
+            logging.warning(f"Unexpected structure in CT log list data from {self.list_url}.")
+            return []
 
         usable_logs = []
         now = datetime.now(timezone.utc)
         for log in raw_log_entries:
-            if not isinstance(log, dict): continue
+            if not isinstance(log, dict):
+                continue
 
             state = log.get("state")
             if not isinstance(state, dict) or "usable" not in state:
-                 continue
+                continue
 
             interval = log.get("temporal_interval")
             if isinstance(interval, dict):
@@ -59,7 +64,7 @@ class CTLogListProvider:
                         if not (start <= now < end):
                             continue
                 except (ValueError, TypeError) as e:
-                    log_desc = log.get('description', 'Unknown Log')
+                    log_desc = log.get("description", "Unknown Log")
                     logging.warning(f"Cannot parse temporal_interval for log '{log_desc}': {e}. Skipping log.")
                     continue
 
